@@ -47,6 +47,9 @@
   "Running gptcommit process for current repository.
 Stored as a cons cell (PROCESS . RESPONSE) where RESPONE is a SSO Message.")
 
+(defvar-local magit-gptcommit--buffer-repository-key nil
+  "Repository key associated with this buffer for gptcommit cleanup.")
+
 (cl-defstruct magit-gptcommit--worker
   "Structure respesenting current active llm request."
   key llm-request message sections)
@@ -350,11 +353,15 @@ NO-CACHE is non-nil if cache should be ignored."
                        :tracking-marker tracking-marker)
                  #'magit-gptcommit--stream-insert-response))))
           ;; store section in repository-local active worker
-          (let ((section (car (last (oref magit-root-section children))))
-                (worker (magit-repository-local-get 'magit-gptcommit--active-worker)))
-            (oset worker sections
-                  (cons (cons buf section)
-                        (oref worker sections))))
+          (let* ((section (car (last (oref magit-root-section children))))
+                 (worker (magit-repository-local-get 'magit-gptcommit--active-worker)))
+            (let ((repo-key (magit-repository-local-repository)))
+              (oset worker sections
+                    (cons (cons buf section)
+                          (oref worker sections)))
+              ;; Store repo key for the hook and add hook locally to this buffer
+              (setq-local magit-gptcommit--buffer-repository-key repo-key)
+              (add-hook 'kill-buffer-hook #'magit-gptcommit--buffer-kill-hook nil t)))
           (setq-local magit-inhibit-refresh t)))
       ;; move section to correct position
       (oset magit-root-section children
@@ -384,6 +391,12 @@ NO-CACHE is non-nil if cache should be ignored."
       (let ((buf (car pair)))
         (with-current-buffer buf
           (setq-local magit-inhibit-refresh nil))))
+    ;; Remove buffer-local kill hooks before deleting worker
+    (dolist (pair (oref worker sections))
+      (-let (((buf . _section) pair))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (remove-hook 'kill-buffer-hook #'magit-gptcommit--buffer-kill-hook t)))))
     (magit-repository-local-delete 'magit-gptcommit--active-worker repository)
     (llm-cancel-request (oref worker llm-request))))
 
@@ -551,6 +564,13 @@ Calls CALLBACK with the prompt response and INFO to update the response."
 (defun magit-gptcommit--llm-finalize ()
   "Finalize llm prompt response."
   (setq-local magit-inhibit-refresh nil)
+  ;; Remove buffer-local kill hooks
+  (when-let ((worker (magit-repository-local-get 'magit-gptcommit--active-worker)))
+    (dolist (pair (oref worker sections))
+      (-let (((buf . _section) pair))
+        (when (buffer-live-p buf)
+          (with-current-buffer buf
+            (remove-hook 'kill-buffer-hook #'magit-gptcommit--buffer-kill-hook t))))))
   (magit-repository-local-delete 'magit-gptcommit--active-worker))
 
 (defun magit-gptcommit--llm-chat-streaming (key info callback)
@@ -591,16 +611,17 @@ Call CALLBACK with the response and INFO with partial and full responses."
 ;; Add buffer-kill-hooks to abort gptcommit when magit buffers are killed
 (defun magit-gptcommit--buffer-kill-hook ()
   "Abort gptcommit when a buffer is killed that might be part of the process."
-  (when-let ((worker (magit-repository-local-get 'magit-gptcommit--active-worker)))
-    (let ((sections (oref worker sections))
-          (current-buf (current-buffer)))
-      ;; If this buffer is in the sections, abort the entire process
-      (when (assq current-buf sections)
-        (message "Magit buffer killed, aborting gptcommit process")
-        (magit-gptcommit-abort)))))
-
-;; Add the hook
-(add-hook 'kill-buffer-hook #'magit-gptcommit--buffer-kill-hook)
+  (remove-hook 'kill-buffer-hook #'magit-gptcommit--buffer-kill-hook t)
+  ;; Use the stored repository key to avoid TRAMP recursion
+  (let ((repo-key magit-gptcommit--buffer-repository-key))
+    (when repo-key
+      (when-let ((worker (magit-repository-local-get 'magit-gptcommit--active-worker nil repo-key)))
+        (let ((sections (oref worker sections))
+              (current-buf (current-buffer)))
+          ;; If this buffer is in the sections, abort the entire process for this repo
+          (when (assq current-buf sections)
+            (message "Magit buffer killed, aborting gptcommit process for %s" repo-key)
+            (magit-gptcommit-abort repo-key)))))))
 
 ;;;; Footer
 
