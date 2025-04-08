@@ -602,7 +602,6 @@ Call CALLBACK with the response and INFO with partial and full responses."
               (current-buf (current-buffer)))
     ;; If this buffer is in the sections, abort the entire process
     (when (assq current-buf sections)
-      (message "Magit buffer killed, aborting gptcommit process")
       (magit-gptcommit-abort))))
 
 ;;;; Footer
